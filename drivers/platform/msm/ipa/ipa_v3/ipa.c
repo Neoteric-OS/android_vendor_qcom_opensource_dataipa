@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
  *
- * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/clk.h>
@@ -161,6 +161,8 @@ static void ipa3_free_pkt_init_ex(void);
 #if IS_ENABLED(CONFIG_DEEPSLEEP) || IS_ENABLED(CONFIG_HIBERNATION)
 static void ipa3_deepsleep_resume(void);
 static void ipa3_deepsleep_suspend(void);
+static void ipa3_xbl_ipa_init(struct work_struct *work);
+static DECLARE_WORK(ipa3_xbl_init_work, ipa3_xbl_ipa_init);
 #endif
 
 static void ipa3_load_ipa_fw(struct work_struct *work);
@@ -176,6 +178,11 @@ static DECLARE_DELAYED_WORK(ipa_dec_clients_disable_clks_on_suspend_irq_wq_work,
 static void ipa_inc_clients_enable_clks_on_wq(struct work_struct *work);
 static DECLARE_WORK(ipa_inc_clients_enable_clks_on_wq_work,
 	ipa_inc_clients_enable_clks_on_wq);
+
+#ifdef CONFIG_IPA_RTP
+static void ipa_xr_uc_init_wq_handler(struct work_struct *work);
+static DECLARE_DELAYED_WORK(ipa_xr_uc_init_handle, ipa_xr_uc_init_wq_handler);
+#endif
 
 static int ipa3_ioctl_add_rt_rule_v2(unsigned long arg);
 static int ipa3_ioctl_add_rt_rule_ext_v2(unsigned long arg);
@@ -520,11 +527,24 @@ EXPORT_SYMBOL(ipa_smmu_free_sgt);
 
 static int ipa_pm_notify(struct notifier_block *b, unsigned long event, void *p)
 {
+	int i;
 	IPADBG("Entry\n");
 	switch (event) {
+	case PM_SUSPEND_PREPARE:
+		/* In case there is a tx/rx handler in polling mode fail to suspend */
+		for (i = 0; i < ipa3_ctx->ipa_num_pipes; i++) {
+			if (ipa3_ctx->ep[i].sys &&
+					atomic_read(&ipa3_ctx->ep[i].sys->curr_polling_state)) {
+				IPAERR("EP %d is in polling state, do not suspend\n", i);
+				return -EAGAIN;
+			}
+		}
+		ipa_pm_deactivate_all_deferred();
+		atomic_set(&ipa3_ctx->is_suspend_mode_enabled, 1);
+		break;
 	case PM_POST_SUSPEND:
 #if IS_ENABLED(CONFIG_DEEPSLEEP)
-		if (pm_suspend_via_firmware() && ipa3_ctx->deepsleep) {
+		if (ipa3_ctx->deepsleep) {
 			IPADBG("Enter deepsleep resume\n");
 			ipa3_deepsleep_resume();
 			IPADBG("Exit deepsleep resume\n");
@@ -549,6 +569,9 @@ static int ipa_pm_notify(struct notifier_block *b, unsigned long event, void *p)
 
 static struct notifier_block ipa_pm_notifier = {
 	.notifier_call = ipa_pm_notify,
+#if IS_ENABLED(CONFIG_DEEPSLEEP) || IS_ENABLED(CONFIG_HIBERNATION)
+	.priority = INT_MAX,
+#endif
 };
 
 static const struct dev_pm_ops ipa_pm_ops = {
@@ -7672,6 +7695,12 @@ static void ipa3_register_panic_hdlr(void)
 		&ipa3_panic_blk);
 }
 
+static void ipa3_unregister_panic_hdlr(void)
+{
+	atomic_notifier_chain_unregister(&panic_notifier_list,
+		&ipa3_panic_blk);
+}
+
 static void ipa3_uc_is_loaded(void)
 {
 	IPADBG("\n");
@@ -7874,6 +7903,27 @@ static void ipa_gsi_map_unmap_gsi_msi_addr(bool map)
 	}
 }
 
+#ifdef CONFIG_IPA_RTP
+static int ipa3_xr_uc_loaded_handler(struct notifier_block *self,
+	unsigned long val, void *data)
+{
+	ipa3_ctx->xr_uc_init_wq =
+		create_singlethread_workqueue("xr_uc_init_wq");
+	if (!ipa3_ctx->xr_uc_init_wq) {
+		IPAERR("failed to create xr uc initialization wq\n");
+		return -EINVAL;
+	}
+
+	queue_delayed_work(ipa3_ctx->xr_uc_init_wq,
+		&ipa_xr_uc_init_handle,
+		msecs_to_jiffies(XR_IPA_UC_INIT_TIMEOUT_MSEC));
+	return 0;
+}
+
+static struct notifier_block xr_uc_loaded_cb = {
+	.notifier_call = ipa3_xr_uc_loaded_handler,
+};
+#endif
 
 /**
  * ipa3_post_init() - Initialize the IPA Driver (Part II).
@@ -8153,7 +8203,7 @@ static int ipa3_post_init(const struct ipa3_plat_drv_res *resource_p,
 	/* GSI 2.2 requires to allocate all EE GSI channel
 	 * during device bootup.
 	 */
-	if (gsi_props.ver == GSI_VER_2_2) {
+	if (gsi_props.ver == GSI_VER_2_2 && !ipa3_ctx->gsi_status) {
 		result = ipa3_alloc_gsi_channel();
 		if (result) {
 			IPAERR("Failed to alloc the GSI channels\n");
@@ -8277,40 +8327,11 @@ static int ipa3_post_init(const struct ipa3_plat_drv_res *resource_p,
 
 #ifdef CONFIG_IPA_RTP
 	if (ipa3_ctx->platform_type == IPA_PLAT_TYPE_XR) {
-
-		IPA_ACTIVE_CLIENTS_INC_SIMPLE();
-		result = ipa3_alloc_temp_buffs_to_uc(TEMP_BUFF_SIZE, NO_OF_BUFFS);
+		result = ipa3_uc_register_ready_cb(&xr_uc_loaded_cb);
 		if (result) {
-			IPAERR("Temp buffer allocations for uC failed %d\n", result);
-			result = -ENODEV;
-			IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
+			IPAERR("Failed to register uc ready cb\n");
 			goto fail_teth_bridge_driver_init;
 		}
-
-		result = ipa3_allocate_uc_pipes_er_tr_send_to_uc();
-		if (result) {
-			IPAERR("ER and TR allocations for uC pipes failed %d\n", result);
-			ipa3_free_uc_temp_buffs(NO_OF_BUFFS);
-			result = -ENODEV;
-			IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
-			goto fail_teth_bridge_driver_init;
-		}
-
-		/*
-		* Here, synx_init API calls will be success only
-		* when hw-fence is enabled by default in builds.
-		*/
-		result = ipa3_create_hfi_send_uc();
-		if (result) {
-			IPAERR("HFI Creation failed %d\n", result);
-			ipa3_free_uc_temp_buffs(NO_OF_BUFFS);
-			ipa3_free_uc_pipes_er_tr();
-			result = -ENODEV;
-			IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
-			goto fail_teth_bridge_driver_init;
-		}
-
-		IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
 	}
 #endif
 
@@ -8355,6 +8376,41 @@ fail_ipahal:
 
 	return result;
 }
+
+#ifdef CONFIG_IPA_RTP
+static void ipa_xr_uc_init_wq_handler(struct work_struct *work)
+{
+	int result;
+
+	IPADBG("Entry\n");
+	IPA_ACTIVE_CLIENTS_INC_SIMPLE();
+	result = ipa3_create_hfi_send_uc();
+	if (result) {
+		IPAERR("HFI Creation failed\n");
+		IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
+		ipa_assert();
+	}
+
+	result = ipa3_alloc_temp_buffs_to_uc(TEMP_BUFF_SIZE, NO_OF_BUFFS);
+	if (result) {
+		IPAERR("Temp buffer allocations for uC failed %d\n", result);
+		ipa3_synx_uninitialize();
+		IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
+		ipa_assert();
+	}
+
+	result = ipa3_allocate_uc_pipes_er_tr_send_to_uc();
+	if (result) {
+		IPAERR("ER and TR allocations for uC pipes failed %d\n", result);
+		ipa3_synx_uninitialize();
+		ipa3_free_uc_temp_buffs(NO_OF_BUFFS);
+		IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
+		ipa_assert();
+	}
+
+	IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
+}
+#endif
 
 static int ipa3_manual_load_ipa_fws(void)
 {
@@ -8540,6 +8596,27 @@ static int ipa3_pil_unload_ipa_fws(void)
 #endif
 	return 0;
 }
+
+static void ipa3_xbl_ipa_init(struct work_struct *work)
+{
+	int result;
+
+	IPAERR("Using XBL boot load for IPA FW\n");
+
+	result = ipa3_attach_to_smmu();
+	if (result) {
+		IPAERR("IPA attach to smmu failed %d\n",
+				result);
+		return;
+	}
+
+	result = ipa3_post_init(&ipa3_res, ipa3_ctx->cdev.dev);
+	if (result) {
+		IPAERR("IPA post init failed %d\n", result);
+		return;
+
+	}
+}
 #endif
 
 static void ipa3_load_ipa_fw(struct work_struct *work)
@@ -8560,46 +8637,53 @@ static void ipa3_load_ipa_fw(struct work_struct *work)
 		return;
 	}
 
-	if (ipa3_ctx->ipa3_hw_mode != IPA_HW_MODE_EMULATION &&
-	    ((ipa3_ctx->platform_type != IPA_PLAT_TYPE_MDM) ||
-	    (ipa3_ctx->ipa_hw_type >= IPA_HW_v3_5))) {
-		/* some targets sharing same lunch option but
-		 * using different signing images, adding support to
-		 * load specific FW image to based on dt entry.
-		 */
+	ipa3_ctx->gsi_status = gsi_status_enabled();
+
+	if (!ipa3_ctx->gsi_status) {
+		if (ipa3_ctx->ipa3_hw_mode != IPA_HW_MODE_EMULATION &&
+			((ipa3_ctx->platform_type != IPA_PLAT_TYPE_MDM) ||
+			(ipa3_ctx->ipa_hw_type >= IPA_HW_v3_5))) {
+			/* some targets sharing same lunch option but
+			 * using different signing images, adding support to
+			 * load specific FW image to based on dt entry.
+			 */
 #if IS_ENABLED(CONFIG_QCOM_MDT_LOADER)
-		if (ipa3_ctx->gsi_fw_file_name)
-			result = ipa3_mdt_load_ipa_fws(
-						ipa3_ctx->gsi_fw_file_name);
-		else
-			result = ipa3_mdt_load_ipa_fws(IPA_SUBSYSTEM_NAME);
+			if (ipa3_ctx->gsi_fw_file_name)
+				result = ipa3_mdt_load_ipa_fws(
+							ipa3_ctx->gsi_fw_file_name);
+			else
+				result = ipa3_mdt_load_ipa_fws(IPA_SUBSYSTEM_NAME);
 #else /* IS_ENABLED(CONFIG_QCOM_MDT_LOADER) */
-		if (ipa3_ctx->gsi_fw_file_name)
-			result = ipa3_pil_load_ipa_fws(
-						ipa3_ctx->gsi_fw_file_name);
-		else
-			result = ipa3_pil_load_ipa_fws(IPA_SUBSYSTEM_NAME);
+			if (ipa3_ctx->gsi_fw_file_name)
+				result = ipa3_pil_load_ipa_fws(
+							ipa3_ctx->gsi_fw_file_name);
+			else
+				result = ipa3_pil_load_ipa_fws(IPA_SUBSYSTEM_NAME);
 #endif /* IS_ENABLED(CONFIG_QCOM_MDT_LOADER) */
+		} else {
+			result = ipa3_manual_load_ipa_fws();
+		}
+
+		if (result) {
+			ipa3_ctx->ipa_pil_load++;
+			IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
+			IPADBG("IPA firmware loading deferred to a work queue\n");
+			queue_delayed_work(ipa3_ctx->transport_power_mgmt_wq,
+				&ipa3_fw_load_failure_handle,
+				msecs_to_jiffies(DELAY_BEFORE_FW_LOAD));
+			return;
+		}
+		mutex_lock(&ipa3_ctx->fw_load_data.lock);
+		ipa3_ctx->fw_load_data.state = IPA_FW_LOAD_STATE_LOADED;
+		mutex_unlock(&ipa3_ctx->fw_load_data.lock);
+		pr_info("IPA FW loaded successfully\n");
 	} else {
-		result = ipa3_manual_load_ipa_fws();
+		pr_info("IPA FW is already loaded\n");
+		/*uC is already loaded. Marking this as after SSR boot to avoid loading uc again*/
+		ipa3_ctx->uc_ctx.uc_loaded = true;
 	}
 
-
-	if (result) {
-
-		ipa3_ctx->ipa_pil_load++;
-		IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
-		IPADBG("IPA firmware loading deffered to a work queue\n");
-		queue_delayed_work(ipa3_ctx->transport_power_mgmt_wq,
-			&ipa3_fw_load_failure_handle,
-			msecs_to_jiffies(DELAY_BEFORE_FW_LOAD));
-		return;
-	}
 	IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
-	mutex_lock(&ipa3_ctx->fw_load_data.lock);
-	ipa3_ctx->fw_load_data.state = IPA_FW_LOAD_STATE_LOADED;
-	mutex_unlock(&ipa3_ctx->fw_load_data.lock);
-	pr_info("IPA FW loaded successfully\n");
 
 	result = ipa3_post_init(&ipa3_res, ipa3_ctx->cdev.dev);
 	if (result) {
@@ -9031,20 +9115,22 @@ int ipa_set_pkt_init_ex_hdr_ofst(struct ipa_pkt_init_ex_hdr_ofst_set
 	}
 	if (proc_ctx) {
 		res = ipa3_get_hdr_proc_ctx_offset(lookup->name, &offset);
+		cmd.rt_hdr_offset = offset;
+		cmd.cs_disable = false;
 	} else {
 		res = ipa3_get_hdr_offset(lookup->name ,&offset);
+		cmd.rt_hdr_offset = (IPA_MEM_PART(modem_hdr_size) + offset) >> 2;
+		cmd.cs_disable = true;
 	}
 	if (res != 0)
 		return res;
 
-	cmd.rt_hdr_offset = offset;
 	IPADBG("cmd.rt_hdr_offset=%d\n", cmd.rt_hdr_offset);
 	cmd.frag_disable = true;
 	cmd.nat_disable = true;
 	cmd.filter_disable = true;
 	cmd.route_disable = true;
 	cmd.hdr_removal_insertion_disable = false;
-	cmd.cs_disable = false;
 	cmd.flt_retain_hdr = true;
 	cmd.rt_retain_hdr = true;
 	cmd.rt_pipe_dest_idx = dst_ep_idx;
@@ -9246,6 +9332,7 @@ static int ipa3_pre_init(const struct ipa3_plat_drv_res *resource_p,
 				0xFF;
 	}
 
+	ipa3_ctx->gfp_no_retry = resource_p->gfp_no_retry;
 	ipa3_ctx->ipa_wrapper_base = resource_p->ipa_mem_base;
 	ipa3_ctx->ipa_wrapper_size = resource_p->ipa_mem_size;
 	ipa3_ctx->ipa_cfg_offset = resource_p->ipa_cfg_offset;
@@ -10323,6 +10410,7 @@ static int get_ipa_dts_configuration(struct platform_device *pdev,
 	ipa_drv_res->rmnet_ll_enable = 0;
 	ipa_drv_res->ulso_wa = false;
 	ipa_drv_res->coal_ipv4_id_ignore = true;
+	ipa_drv_res->gfp_no_retry = false;
 
 	/* Get IPA HW Version */
 	result = of_property_read_u32(pdev->dev.of_node, "qcom,ipa-hw-ver",
@@ -10433,6 +10521,11 @@ static int get_ipa_dts_configuration(struct platform_device *pdev,
 		ipa_drv_res->ipa_endp_delay_wa_v2 = false;
 	}
 
+	ipa_drv_res->gfp_no_retry = of_property_read_bool(pdev->dev.of_node,
+			"qcom,gfp-no-retry");
+	IPADBG(": gfp-no-retry = %s\n",
+			ipa_drv_res->gfp_no_retry
+			? "True" : "False");
 
 	ipa_drv_res->ulso_wa = of_property_read_bool(pdev->dev.of_node,
 			"qcom,ipa-ulso-wa");
@@ -12104,14 +12197,14 @@ int ipa3_ap_suspend(struct device *dev)
 
 
 #if IS_ENABLED(CONFIG_DEEPSLEEP)
-	if (pm_suspend_via_firmware()) {
+	if (pm_suspend_target_state == PM_SUSPEND_MEM) {
 		IPADBG("Enter deepsleep suspend\n");
 		ipa3_deepsleep_suspend();
 		IPADBG("Exit deepsleep suspend\n");
 	}
 #endif
 	ipa_pm_deactivate_all_deferred();
-
+	atomic_set(&ipa3_ctx->is_suspend_mode_enabled, 1);
 	IPADBG("Exit\n");
 
 	return 0;
@@ -12188,6 +12281,10 @@ EXPORT_SYMBOL(ipa_get_lan_rx_napi);
 static void ipa3_deepsleep_suspend(void)
 {
 	IPADBG("Entry\n");
+	if (ipa3_ctx->deepsleep) {
+		IPAERR("Already in deepsleep mode\n");
+		return;
+	}
 	IPA_ACTIVE_CLIENTS_INC_SIMPLE();
 
 #if IS_ENABLED(CONFIG_DEEPSLEEP)
@@ -12197,7 +12294,7 @@ static void ipa3_deepsleep_suspend(void)
 	ipa3_ctx->deepsleep = true;
 	/*Disabling the LAN NAPI*/
 	ipa3_disable_napi_lan_rx();
-	/*NOt allow uC related operations until uC load again*/
+	/*Not allow uC related operations until uC load again*/
 	ipa3_ctx->uc_ctx.uc_loaded = false;
 	/*Disconnecting LAN PROD/LAN CONS/CMD PROD apps pipes*/
 	ipa3_teardown_apps_pipes();
@@ -12217,6 +12314,8 @@ static void ipa3_deepsleep_suspend(void)
 	/*Destroying ipa hal module*/
 	ipahal_destroy();
 	ipa3_ctx->ipa_initialization_complete = false;
+	ipa3_unregister_panic_hdlr();
+	ipa3_wigig_deinit_i();
 	ipa3_debugfs_remove();
 	/*Unloading IPA FW to allow FW load in resume*/
 	ipa3_pil_unload_ipa_fws();
@@ -12232,8 +12331,13 @@ static void ipa3_deepsleep_resume(void)
 	ipa3_ctx->deepsleep = false;
 	ipa3_usb_register_ready_cb();
 	/*Scheduling WQ to load IPA FW*/
-	queue_work(ipa3_ctx->transport_power_mgmt_wq,
-		&ipa3_fw_loading_work);
+	if (ipa3_ctx->use_xbl_boot) {
+		queue_work(ipa3_ctx->transport_power_mgmt_wq,
+				&ipa3_xbl_init_work);
+	} else {
+		queue_work(ipa3_ctx->transport_power_mgmt_wq,
+				&ipa3_fw_loading_work);
+	}
 	IPADBG("Exit\n");
 }
 #endif

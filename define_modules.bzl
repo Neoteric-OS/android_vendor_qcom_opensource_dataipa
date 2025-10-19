@@ -12,13 +12,6 @@ def define_modules(target, variant):
     mod_list = []
     ipam_deps_list = []
     ipam_local_defines = []
-    if target != "niobe":
-             ipam_deps_list.append(
-              "//vendor/qcom/opensource/datarmnet-ext/mem:{}_rmnet_mem".format(kernel_build_variant),
-             )
-             ipam_local_defines.append(
-              "CONFIG_IPA_RMNET_MEM=y".format(include_base),
-             )
     if target == "niobe":
             ipam_deps_list.extend([
              "//vendor/qcom/opensource/synx-kernel:synx_headers",
@@ -27,6 +20,18 @@ def define_modules(target, variant):
             ipam_local_defines.append(
               "CONFIG_IPA_RTP=y".format(include_base),
             )
+    elif target == "seraph":
+            ipam_deps_list.extend([
+             "//vendor/qcom/opensource/synx-kernel:synx_headers",
+             "//vendor/qcom/opensource/synx-kernel:{}_modules".format(kernel_build_variant),
+            ])
+    else:
+             ipam_deps_list.append(
+              "//vendor/qcom/opensource/datarmnet-ext/mem:{}_rmnet_mem".format(kernel_build_variant),
+             )
+             ipam_local_defines.append(
+              "CONFIG_IPA_RMNET_MEM=y".format(include_base),
+             )
 
     ddk_module(
         name = "{}_gsim".format(kernel_build_variant),
@@ -121,7 +126,9 @@ def define_modules(target, variant):
             "drivers/platform/msm/ipa/ipa_clients/ipa_wdi3.c",
             "drivers/platform/msm/ipa/ipa_clients/ipa_wigig.c",
             "drivers/platform/msm/ipa/ipa_clients/rndis_ipa.h",
+            "drivers/platform/msm/ipa/ipa_clients/ncm_ipa.h",
             "drivers/platform/msm/ipa/ipa_clients/rndis_ipa_trace.h",
+            "drivers/platform/msm/ipa/ipa_clients/ncm_ipa_trace.h",
             "drivers/platform/msm/ipa/ipa_v3/ipahal/ipahal.c",
             "drivers/platform/msm/ipa/ipa_v3/ipahal/ipahal.h",
             "drivers/platform/msm/ipa/ipa_v3/ipahal/ipahal_fltrt.c",
@@ -192,6 +199,11 @@ def define_modules(target, variant):
                     "drivers/platform/msm/ipa/ipa_clients/rndis_ipa.c",
                 ],
             },
+            "CONFIG_NCM_IPA": {
+                True: [
+                    "drivers/platform/msm/ipa/ipa_clients/ncm_ipa.c",
+                ],
+            },
             "CONFIG_IPA_UT": {
                 True: [
                     "drivers/platform/msm/ipa/test/ipa_ut_framework.c",
@@ -219,6 +231,7 @@ def define_modules(target, variant):
             "GSI_TRACE_INCLUDE_PATH={}/drivers/platform/msm/gsi".format(include_base),
             "IPA_TRACE_INCLUDE_PATH={}/drivers/platform/msm/ipa/ipa_v3".format(include_base),
             "RNDIS_TRACE_INCLUDE_PATH={}/drivers/platform/msm/ipa/ipa_clients".format(include_base),
+            "NCM_TRACE_INCLUDE_PATH={}/drivers/platform/msm/ipa/ipa_clients".format(include_base),
         ] + ipam_local_defines,
         kernel_build = "//msm-kernel:{}".format(kernel_build_variant),
         deps = [
